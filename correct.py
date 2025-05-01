@@ -1,20 +1,17 @@
-# /correct.py:
-#--------------------------------------------------------------------------------
 import sys
 import numpy as np
 import cv2
 import math
-import os # Added
-import glob # Added
+import os
+import glob
 
+# --- Constants ---
 THRESHOLD_RATIO = 2000
 MIN_AVG_RED = 60
-MAX_HUE_SHIFT = 120
+# MAX_HUE_SHIFT = 120 # Original Value
+MAX_HUE_SHIFT = 100 # Reduced max hue shift slightly
 BLUE_MAGIC_VALUE = 1.2
 SAMPLE_SECONDS = 2 # Extracts color correction from every N seconds
-
-# Supported image extensions for directory processing
-IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff') # Added
 
 def hue_shift_red(mat, h):
 
@@ -27,6 +24,18 @@ def hue_shift_red(mat, h):
 
     return np.dstack([r, g, b])
 
+IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff')
+
+# --- New constants to control brightness/gain ---
+MAX_NORMALIZATION_GAIN = 3.5 # Clamp maximum gain applied during normalization
+MIN_NORM_RANGE = 50         # Ensure the normalization range is at least this wide
+
+# --- Optional Gamma Correction ---
+# APPLY_GAMMA_CORRECTION = True
+# GAMMA_VALUE = 1.1 # > 1 compresses highlights, < 1 expands them. 1.1 is subtle.
+
+# (Keep hue_shift_red, normalizing_interval as they are, unless normalizing_interval fix was needed)
+# Make sure the normalizing_interval fix from the previous step is included if it wasn't already:
 def normalizing_interval(array):
 
     high = 255
@@ -39,11 +48,12 @@ def normalizing_interval(array):
         if array[i] != 0:
             first_valid_index = i
             break
-            
+
     # If all values are 0 (unlikely but possible), return default
     if first_valid_index == -1:
+        # Fallback to a safe default range if no valid data points
         return (0, 255)
-        
+
     low = array[first_valid_index] # Initialize low
 
     # Iterate from the second valid value onwards
@@ -51,38 +61,37 @@ def normalizing_interval(array):
     for i in range(first_valid_index + 1, len(array)):
         if array[i] == 0: # Skip zero placeholders
             continue
-            
+
         dist = array[i] - current_low_candidate
         if(dist > max_dist):
             max_dist = dist
             high = array[i]
             low = current_low_candidate
-            
+
         current_low_candidate = array[i] # Update for next comparison
 
-    # Handle edge case: if only one non-zero value found
+    # Handle edge case: if only one non-zero value found or high didn't move
     if high == 255 and low == array[first_valid_index] and max_dist == 0:
-         if first_valid_index > 0: # If the first value wasn't 0 itself
-              low = array[first_valid_index-1] # Use the value before it if possible (should be 0)
-         #else keep low as the first value. High remains 255.
+         # If the single valid point isn't 0, try using 0 as low
+         if low > 0 :
+             low = 0 # Widen the range by setting low to 0
+         # else keep low=0, high=255
 
     # Ensure low and high are different if possible, handle plateau at 255
-    if low == high:
-       if high < 255:
-           high += 1 # Ensure at least a minimal interval if stuck
-       elif low > 0:
-           low -=1
-           
-    # Final safety check for valid range
     if low >= high:
-       low = 0
-       high = 255
-
+        # Try to establish a minimal valid range if they ended up the same
+        if high < 255:
+            high += 1
+        elif low > 0:
+            low -= 1
+        else: # Failsafe if low=high=0 or low=high=255
+            low = 0
+            high = 255
 
     return (low, high)
 
-def apply_filter(mat, filt):
 
+def apply_filter(mat, filt):
     # Ensure input is float for calculations
     mat_float = mat.astype(np.float32)
 
@@ -97,22 +106,27 @@ def apply_filter(mat, filt):
 
     # Stack, clip, and convert back to uint8
     filtered_mat = np.dstack([new_r, new_g, new_b])
+
+    # --- Optional Gamma Correction Step ---
+    # if APPLY_GAMMA_CORRECTION:
+    #     # Avoid division by zero or log(0) errors
+    #     filtered_mat = np.clip(filtered_mat, 1, 255) # Clip slightly above 0 before division
+    #     filtered_mat = np.power(filtered_mat / 255.0, 1.0 / GAMMA_VALUE) * 255.0
+
+    # Final Clipping
     filtered_mat = np.clip(filtered_mat, 0, 255).astype(np.uint8)
 
     return filtered_mat
 
-# --- New function for aggregate statistics ---
+
+# --- Function for aggregate statistics ---
 def get_aggregate_filter_matrix(image_paths):
+    # (Keep the analysis part the same as before)
+    # ... (analysis loop accumulating sum_avg_r/g/b, sum_hist_r/g/b, total_pixels, valid_image_count) ...
     print(f"Analyzing {len(image_paths)} images for aggregate statistics...")
     if not image_paths:
         print("Warning: No image paths provided for aggregate analysis.")
-        # Return a default identity filter or raise an error
-        return np.array([
-            1, 0, 0, 0, 0,
-            0, 1, 0, 0, 0,
-            0, 0, 1, 0, 0,
-            0, 0, 0, 1, 0,
-        ])
+        return np.array([1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0], dtype=np.float32) # Identity
 
     sum_avg_r, sum_avg_g, sum_avg_b = 0.0, 0.0, 0.0
     sum_hist_r = np.zeros((256, 1), dtype=np.float32)
@@ -129,17 +143,13 @@ def get_aggregate_filter_matrix(image_paths):
             continue
 
         mat_rgb = cv2.cvtColor(mat, cv2.COLOR_BGR2RGB)
-        # Resize for consistent analysis speed & weighting (like original function)
         mat_resized = cv2.resize(mat_rgb, (256, 256))
 
-        # Accumulate average values
-        avg_bgr = cv2.mean(mat_resized)[:3] # Note: cv2.mean returns B,G,R order
+        avg_bgr = cv2.mean(mat_resized)[:3]
         sum_avg_b += avg_bgr[0]
         sum_avg_g += avg_bgr[1]
         sum_avg_r += avg_bgr[2]
 
-
-        # Accumulate histograms
         hist_r = cv2.calcHist([mat_resized], [0], None, [256], [0,256])
         hist_g = cv2.calcHist([mat_resized], [1], None, [256], [0,256])
         hist_b = cv2.calcHist([mat_resized], [2], None, [256], [0,256])
@@ -147,7 +157,6 @@ def get_aggregate_filter_matrix(image_paths):
         sum_hist_g += hist_g
         sum_hist_b += hist_b
 
-        # Accumulate total pixels (from resized)
         total_pixels += mat_resized.shape[0] * mat_resized.shape[1]
         valid_image_count += 1
 
@@ -155,69 +164,38 @@ def get_aggregate_filter_matrix(image_paths):
 
     if valid_image_count == 0:
         print("Error: No valid images found in the directory.")
-        # Return a default identity filter
-        return np.array([
-            1, 0, 0, 0, 0,
-            0, 1, 0, 0, 0,
-            0, 0, 1, 0, 0,
-            0, 0, 0, 1, 0,
-        ])
+        return np.array([1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0], dtype=np.float32) # Identity
 
-    # Calculate overall average RGB
-    # OpenCV mean is BGR, but we accumulated with R, G, B naming. Let's recalculate average correctly from sums.
     overall_avg_r = sum_avg_r / valid_image_count
     overall_avg_g = sum_avg_g / valid_image_count
     overall_avg_b = sum_avg_b / valid_image_count
-    # avg_mat represents the average RGB pixel for hue shift calculation
     avg_mat = np.array([[[overall_avg_r, overall_avg_g, overall_avg_b]]], dtype=np.float32)
 
-
-    # Find hue shift so that average red reaches MIN_AVG_RED
-    # The hue shift needs to work on the *average* color vector, not the whole image average value
-    # Let's calculate the hue shift based on the average pixel color vector directly
+    # Find hue shift
     hue_shift = 0
-    current_avg_pixel = avg_mat.copy() # Start with the calculated average RGB
-    # We need to simulate the *effect* of the hue shift on the R channel contribution.
-    # The original logic `np.sum(shifted)` on a single pixel doesn't make sense.
-    # Let's reinterpret: shift the *average pixel* and check its new red component.
+    current_avg_pixel = avg_mat.copy()
     new_avg_r_component = current_avg_pixel[0,0,0]
 
     while(new_avg_r_component < MIN_AVG_RED):
         hue_shift += 1
-        if hue_shift > MAX_HUE_SHIFT:
-            # Prevent excessive shift, cap effect at MIN_AVG_RED equivalent shift
-            print(f"Warning: Max hue shift ({MAX_HUE_SHIFT}) reached. Clamping red boost.")
-            # Find the shift that *would* get it there if possible (approximate)
-            # This part is tricky without re-applying to an image. Let's cap the shift value.
+        if hue_shift > MAX_HUE_SHIFT: # Use the reduced MAX_HUE_SHIFT
+            print(f"Warning: Max hue shift ({MAX_HUE_SHIFT}) reached during aggregate analysis.")
             hue_shift = MAX_HUE_SHIFT
-            break # Exit loop
-
+            break
         shifted_avg_pixel = hue_shift_red(current_avg_pixel, hue_shift)
-        new_avg_r_component = shifted_avg_pixel[0,0,0] # Check the red component of the shifted average pixel
-
+        new_avg_r_component = shifted_avg_pixel[0,0,0]
     print(f"Calculated aggregate hue shift: {hue_shift}")
 
-    # Note: The original logic applied the hue shift *back* to the image's red channel
-    # before histogram analysis. This is complex with aggregate stats without processing
-    # all pixels again. We will calculate the normalization based on the *original*
-    # aggregate histograms but use the calculated `hue_shift` for the filter matrix gains.
-    # This is a simplification but necessary for performance with directories.
-
-    # Use aggregate histograms for normalization interval calculation
+    # Use aggregate histograms for normalization
     normalize_mat = np.zeros((256, 3))
-    # Use the total pixel count from all *resized* images for the threshold
     threshold_level = total_pixels / THRESHOLD_RATIO
     print(f"Aggregate pixel count: {total_pixels}, Threshold level: {threshold_level}")
 
     for x in range(256):
-        if sum_hist_r[x] < threshold_level:
-            normalize_mat[x][0] = x
-        if sum_hist_g[x] < threshold_level:
-            normalize_mat[x][1] = x
-        if sum_hist_b[x] < threshold_level:
-            normalize_mat[x][2] = x
+        if sum_hist_r[x] < threshold_level: normalize_mat[x][0] = x
+        if sum_hist_g[x] < threshold_level: normalize_mat[x][1] = x
+        if sum_hist_b[x] < threshold_level: normalize_mat[x][2] = x
 
-    # Ensure 255 is always included
     normalize_mat[255][0] = 255
     normalize_mat[255][1] = 255
     normalize_mat[255][2] = 255
@@ -226,33 +204,43 @@ def get_aggregate_filter_matrix(image_paths):
     adjust_g_low, adjust_g_high = normalizing_interval(normalize_mat[..., 1])
     adjust_b_low, adjust_b_high = normalizing_interval(normalize_mat[..., 2])
 
-    print(f"Normalization R: ({adjust_r_low}, {adjust_r_high})")
-    print(f"Normalization G: ({adjust_g_low}, {adjust_g_high})")
-    print(f"Normalization B: ({adjust_b_low}, {adjust_b_high})")
-    
-    # Ensure intervals are valid
-    adjust_r_high = max(adjust_r_high, adjust_r_low + 1)
-    adjust_g_high = max(adjust_g_high, adjust_g_low + 1)
-    adjust_b_high = max(adjust_b_high, adjust_b_low + 1)
+    print(f"Initial Normalization R: ({adjust_r_low}, {adjust_r_high})")
+    print(f"Initial Normalization G: ({adjust_g_low}, {adjust_g_high})")
+    print(f"Initial Normalization B: ({adjust_b_low}, {adjust_b_high})")
+
+    # --- Add Minimum Normalization Range ---
+    adjust_r_high = max(adjust_r_high, adjust_r_low + MIN_NORM_RANGE)
+    adjust_g_high = max(adjust_g_high, adjust_g_low + MIN_NORM_RANGE)
+    adjust_b_high = max(adjust_b_high, adjust_b_low + MIN_NORM_RANGE)
+    # Ensure high does not exceed 255 after adding range
+    adjust_r_high = min(adjust_r_high, 255)
+    adjust_g_high = min(adjust_g_high, 255)
+    adjust_b_high = min(adjust_b_high, 255)
+    # Ensure low is still less than high after adjustments
+    adjust_r_low = min(adjust_r_low, adjust_r_high -1)
+    adjust_g_low = min(adjust_g_low, adjust_g_high -1)
+    adjust_b_low = min(adjust_b_low, adjust_b_high -1)
+
+    print(f"Adjusted Normalization R (Min Range {MIN_NORM_RANGE}): ({adjust_r_low}, {adjust_r_high})")
+    print(f"Adjusted Normalization G (Min Range {MIN_NORM_RANGE}): ({adjust_g_low}, {adjust_g_high})")
+    print(f"Adjusted Normalization B (Min Range {MIN_NORM_RANGE}): ({adjust_b_low}, {adjust_b_high})")
 
 
-    # Calculate filter matrix components using the aggregate hue_shift and normalization
-    # Simulate hue shift on a white pixel [1,1,1] to get channel contributions
-    # Use float32 for accuracy in hue shift calculation
+    # Calculate filter matrix components
     shifted = hue_shift_red(np.array([[[1.0, 1.0, 1.0]]], dtype=np.float32), hue_shift)
     shifted_r, shifted_g, shifted_b = shifted[0][0]
 
-    # Calculate gains and offsets
+    # Calculate gains
     red_gain_norm = 255.0 / (adjust_r_high - adjust_r_low)
     green_gain_norm = 255.0 / (adjust_g_high - adjust_g_low)
     blue_gain_norm = 255.0 / (adjust_b_high - adjust_b_low)
 
-    # Original filter structure seemed to mix normalization gain and hue shift effects.
-    # Let's try to map it:
-    # R' = R*Kr*Hr + G*Kr*Hg + B*Kr*Hb + OR*255
-    # G' = G*Kg     + OG*255
-    # B' = B*Kb     + OB*255
-    # Where K are normalization gains, H are hue shift contributions, O are offsets.
+    # --- Clamp Maximum Gain ---
+    red_gain_norm = min(red_gain_norm, MAX_NORMALIZATION_GAIN)
+    green_gain_norm = min(green_gain_norm, MAX_NORMALIZATION_GAIN)
+    blue_gain_norm = min(blue_gain_norm, MAX_NORMALIZATION_GAIN)
+    print(f"Clamped Gains (Max {MAX_NORMALIZATION_GAIN}): R={red_gain_norm:.2f}, G={green_gain_norm:.2f}, B={blue_gain_norm:.2f}")
+
 
     # Calculate offsets based on normalization low points
     redOffset = (-adjust_r_low / 255.0) * red_gain_norm
@@ -262,149 +250,111 @@ def get_aggregate_filter_matrix(image_paths):
     # Combine hue shift factors with red normalization gain
     adjust_red = shifted_r * red_gain_norm
     adjust_red_green = shifted_g * red_gain_norm
-    adjust_red_blue = shifted_b * red_gain_norm * BLUE_MAGIC_VALUE # Apply magic value here
+    adjust_red_blue = shifted_b * red_gain_norm * BLUE_MAGIC_VALUE
 
-    # Construct the filter matrix (simplified interpretation based on apply_filter structure)
-    # Need to be careful with indices in apply_filter
     filter_matrix = np.array([
-        # Row 1 (Output R = Inp R*c0 + Inp G*c1 + Inp B*c2 + c4*255)
         adjust_red, adjust_red_green, adjust_red_blue, 0, redOffset,
-        # Row 2 (Output G = Inp R*c5 + Inp G*c6 + Inp B*c7 + c9*255) - Assuming G' depends only on G
         0, green_gain_norm, 0, 0, greenOffset,
-         # Row 3 (Output B = Inp R*c10 + Inp G*c11 + Inp B*c12 + c14*255) - Assuming B' depends only on B
         0, 0, blue_gain_norm, 0, blueOffset,
-         # Row 4 (Alpha/Unused)
         0, 0, 0, 1, 0,
-    ], dtype=np.float32) # Use float for filter
+    ], dtype=np.float32)
 
-    print("Calculated Aggregate Filter Matrix:\n", filter_matrix[:15].reshape(3,5)) # Print relevant parts
+    print("Calculated Aggregate Filter Matrix (Clamped):\n", filter_matrix[:15].reshape(3,5))
 
     return filter_matrix
 
 
-# --- New function to process a directory ---
+# --- Function to process a directory (remains the same logic, uses the modified get_aggregate_filter_matrix) ---
 def correct_directory(input_dir, output_dir, output_prefix, yield_preview=False):
-    # Find all image files in the input directory
+    # ... (same as before) ...
     image_paths = []
     for ext in IMAGE_EXTENSIONS:
         image_paths.extend(glob.glob(os.path.join(input_dir, f"*{ext}")))
-        image_paths.extend(glob.glob(os.path.join(input_dir, f"*{ext.upper()}"))) # Include uppercase extensions
+        image_paths.extend(glob.glob(os.path.join(input_dir, f"*{ext.upper()}")))
 
     if not image_paths:
         yield "Error: No image files found in the selected directory.", 0, 0, None
         return
 
-    # Ensure output directory exists
     os.makedirs(output_dir, exist_ok=True)
 
-    # 1. Calculate the single aggregate filter matrix
     yield "Status: Analyzing directory for aggregate filter...", 0, len(image_paths), None
     try:
-        aggregate_filter_matrix = get_aggregate_filter_matrix(image_paths)
+        aggregate_filter_matrix = get_aggregate_filter_matrix(image_paths) # Calls the modified function
     except Exception as e:
          yield f"Error during analysis: {e}", 0, len(image_paths), None
          return
 
-
-    # 2. Apply the filter to each image
     total_images = len(image_paths)
     for i, img_path in enumerate(image_paths):
         base_name = os.path.basename(img_path)
         output_name = f"{output_prefix}_{base_name}"
         output_path = os.path.join(output_dir, output_name)
-
         status = f"Status: Applying filter ({i+1}/{total_images}) to {base_name}..."
         preview_bytes = None
-
         try:
             original_mat = cv2.imread(img_path)
             if original_mat is None:
-                print(f"Warning: Could not read image {img_path} during application phase. Skipping.")
+                print(f"\nWarning: Could not read image {img_path} during application phase. Skipping.")
                 yield status + " Skipped (Read Error).", i + 1, total_images, None
                 continue
-
-            # Convert to RGB for filtering
             rgb_mat = cv2.cvtColor(original_mat, cv2.COLOR_BGR2RGB)
-
-            # Apply the *same* aggregate filter to this image
-            corrected_mat_rgb = apply_filter(rgb_mat, aggregate_filter_matrix)
-
-            # Convert back to BGR for saving
+            corrected_mat_rgb = apply_filter(rgb_mat, aggregate_filter_matrix) # Applies the clamped filter
             corrected_mat_bgr = cv2.cvtColor(corrected_mat_rgb, cv2.COLOR_RGB2BGR)
-
-            # Save the corrected image
             cv2.imwrite(output_path, corrected_mat_bgr)
 
-            # Generate preview if requested
             if yield_preview:
                 preview = original_mat.copy()
                 width = preview.shape[1] // 2
-                # Ensure corrected_mat_bgr has same dimensions as original_mat for preview merge
                 if corrected_mat_bgr.shape == original_mat.shape:
                      preview[::, width:] = corrected_mat_bgr[::, width:]
-                else: # Handle potential resize mismatches if any step changed dims (shouldn't happen here)
-                     print(f"Warning: Dimension mismatch for preview {base_name}")
-                     preview = corrected_mat_bgr # Show only corrected if mismatch
-
-                preview_resized = cv2.resize(preview, (480, 270)) # Smaller preview
+                else:
+                     preview = corrected_mat_bgr
+                preview_resized = cv2.resize(preview, (480, 270))
                 ret, png = cv2.imencode('.png', preview_resized)
-                if ret:
-                    preview_bytes = png.tobytes()
-
+                if ret: preview_bytes = png.tobytes()
 
             yield status, i + 1, total_images, preview_bytes
-
         except Exception as e:
-            error_msg = f"Error processing {base_name}: {e}"
+            error_msg = f"\nError processing {base_name}: {e}"
             print(error_msg)
-            yield status + f" Error ({e})", i + 1, total_images, None # Update status with error
-
+            yield status + f" Error ({e})", i + 1, total_images, None
     yield f"Status: Finished processing {total_images} images.", total_images, total_images, None
 
 
-# --- Original single image correction (kept for potential use/comparison) ---
-def get_filter_matrix(mat):
-
-    mat_resized = cv2.resize(mat, (256, 256)) # Use resized for analysis
-
-    # Get average values of RGB
+# --- Original single image correction (modified to include clamping) ---
+def get_filter_matrix(mat): # For single image / video frames
+    mat_resized = cv2.resize(mat, (256, 256))
     avg_mat_bgr = cv2.mean(mat_resized)[:3]
-    # Create a 1x1 pixel image with the average BGR color, then convert to RGB for hue shift
     avg_pixel_bgr = np.array([[[avg_mat_bgr[0], avg_mat_bgr[1], avg_mat_bgr[2]]]], dtype=np.float32)
     avg_pixel_rgb = cv2.cvtColor(avg_pixel_bgr, cv2.COLOR_BGR2RGB)
 
-
-    # Find hue shift so that average red reaches MIN_AVG_RED
     hue_shift = 0
     current_avg_pixel = avg_pixel_rgb.copy()
     new_avg_r_component = current_avg_pixel[0,0,0]
 
-
     while(new_avg_r_component < MIN_AVG_RED):
         hue_shift += 1
-        if hue_shift > MAX_HUE_SHIFT:
-            hue_shift = MAX_HUE_SHIFT
-            break
-
+        if hue_shift > MAX_HUE_SHIFT: # Use reduced MAX_HUE_SHIFT
+             # print(f"Warning: Max hue shift ({MAX_HUE_SHIFT}) reached for single frame.") # Optional print
+             hue_shift = MAX_HUE_SHIFT
+             break
         shifted_avg_pixel = hue_shift_red(current_avg_pixel, hue_shift)
         new_avg_r_component = shifted_avg_pixel[0,0,0]
 
-    # Apply hue shift to whole image's red channel contribution (Original approach)
+    # Apply hue shift to whole image's red channel for histogram base
     shifted_mat = hue_shift_red(mat_resized.astype(np.float32), hue_shift)
     new_r_channel = np.sum(shifted_mat, axis=2)
     new_r_channel = np.clip(new_r_channel, 0, 255)
-    # Create a temporary mat with the modified red channel for histogram analysis
     mat_for_hist = mat_resized.copy()
     mat_for_hist[..., 0] = new_r_channel.astype(np.uint8)
 
-
-    # Get histogram of all channels (using the temp mat with shifted red influence)
     hist_r = cv2.calcHist([mat_for_hist], [0], None, [256], [0,256])
-    hist_g = cv2.calcHist([mat_for_hist], [1], None, [256], [0,256]) # Use original G,B channels
-    hist_b = cv2.calcHist([mat_for_hist], [2], None, [256], [0,256])
+    hist_g = cv2.calcHist([mat_resized], [1], None, [256], [0,256]) # Use original G,B hist
+    hist_b = cv2.calcHist([mat_resized], [2], None, [256], [0,256])
 
     normalize_mat = np.zeros((256, 3))
-    threshold_level = (mat_resized.shape[0]*mat_resized.shape[1])/THRESHOLD_RATIO # Use resized dimensions
+    threshold_level = (mat_resized.shape[0]*mat_resized.shape[1])/THRESHOLD_RATIO
     for x in range(256):
         if hist_r[x] < threshold_level: normalize_mat[x][0] = x
         if hist_g[x] < threshold_level: normalize_mat[x][1] = x
@@ -418,10 +368,16 @@ def get_filter_matrix(mat):
     adjust_g_low, adjust_g_high = normalizing_interval(normalize_mat[..., 1])
     adjust_b_low, adjust_b_high = normalizing_interval(normalize_mat[..., 2])
 
-    # Ensure intervals are valid
-    adjust_r_high = max(adjust_r_high, adjust_r_low + 1)
-    adjust_g_high = max(adjust_g_high, adjust_g_low + 1)
-    adjust_b_high = max(adjust_b_high, adjust_b_low + 1)
+    # --- Add Minimum Normalization Range ---
+    adjust_r_high = max(adjust_r_high, adjust_r_low + MIN_NORM_RANGE)
+    adjust_g_high = max(adjust_g_high, adjust_g_low + MIN_NORM_RANGE)
+    adjust_b_high = max(adjust_b_high, adjust_b_low + MIN_NORM_RANGE)
+    adjust_r_high = min(adjust_r_high, 255)
+    adjust_g_high = min(adjust_g_high, 255)
+    adjust_b_high = min(adjust_b_high, 255)
+    adjust_r_low = min(adjust_r_low, adjust_r_high -1)
+    adjust_g_low = min(adjust_g_low, adjust_g_high -1)
+    adjust_b_low = min(adjust_b_low, adjust_b_high -1)
 
 
     shifted = hue_shift_red(np.array([[[1.0, 1.0, 1.0]]], dtype=np.float32), hue_shift)
@@ -431,6 +387,11 @@ def get_filter_matrix(mat):
     green_gain_norm = 255.0 / (adjust_g_high - adjust_g_low)
     blue_gain_norm = 255.0 / (adjust_b_high - adjust_b_low)
 
+    # --- Clamp Maximum Gain ---
+    red_gain_norm = min(red_gain_norm, MAX_NORMALIZATION_GAIN)
+    green_gain_norm = min(green_gain_norm, MAX_NORMALIZATION_GAIN)
+    blue_gain_norm = min(blue_gain_norm, MAX_NORMALIZATION_GAIN)
+
     redOffset = (-adjust_r_low / 255.0) * red_gain_norm
     greenOffset = (-adjust_g_low / 255.0) * green_gain_norm
     blueOffset = (-adjust_b_low / 255.0) * blue_gain_norm
@@ -439,7 +400,6 @@ def get_filter_matrix(mat):
     adjust_red_green = shifted_g * red_gain_norm
     adjust_red_blue = shifted_b * red_gain_norm * BLUE_MAGIC_VALUE
 
-    # Construct the filter matrix
     filter_matrix = np.array([
         adjust_red, adjust_red_green, adjust_red_blue, 0, redOffset,
         0, green_gain_norm, 0, 0, greenOffset,

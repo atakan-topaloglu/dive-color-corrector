@@ -360,7 +360,7 @@ if __name__ == "__main__":
                 window["__PROGRESS__"].update(visible=False)
 
 
-        # --- Clear Button ---
+
         if event == "__CLEAR_LIST__":
             window["__INPUT_FILE_LIST__"].update(values=[])
             window["__INPUT_DIRECTORY__"].update("")
